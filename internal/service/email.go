@@ -3,9 +3,12 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/smtp"
 	"strings"
 	"time"
@@ -26,6 +29,12 @@ type EmailService struct {
 	enabled  bool
 	logger   *slog.Logger
 	store    *store.Store
+	// tlsConfig overrides the default STARTTLS settings. Production
+	// leaves this nil so sendOnce builds the standard verify-the-
+	// chain tls.Config. Tests inject a config with
+	// InsecureSkipVerify=true so they can wire up an ephemeral
+	// self-signed cert without poking holes in production trust.
+	tlsConfig *tls.Config
 }
 
 func (s *EmailService) IsConfigured() bool { return s.enabled }
@@ -90,18 +99,13 @@ func (s *EmailService) Send(to, subject, htmlBody string) error {
 		htmlBody,
 	}, "\r\n")
 
-	var auth smtp.Auth
-	if s.username != "" {
-		auth = smtp.PlainAuth("", s.username, s.password, s.host)
-	}
-
 	addr := s.host + ":" + s.port
-	err := smtp.SendMail(addr, auth, s.from, []string{to}, []byte(msg))
+	err := s.sendOnce(addr, to, []byte(msg))
 	if err != nil {
-		// Retry once after a short delay
+		// Retry once after a short delay — transient TCP / TLS hiccups.
 		s.logger.Warn("email send failed, retrying", "to", to, "error", err)
 		time.Sleep(3 * time.Second)
-		err = smtp.SendMail(addr, auth, s.from, []string{to}, []byte(msg))
+		err = s.sendOnce(addr, to, []byte(msg))
 		if err != nil {
 			s.logger.Error("email send failed after retry", "to", to, "error", err)
 			return fmt.Errorf("email send: %w", err)
@@ -110,6 +114,185 @@ func (s *EmailService) Send(to, subject, htmlBody string) error {
 	s.logger.Info("email sent", "to", to, "subject", subject)
 	return nil
 }
+
+// sendOnce drives the SMTP conversation manually so we can negotiate
+// AUTH against whatever mechanism the server actually advertises.
+// Go's stdlib smtp.SendMail unconditionally drives the smtp.Auth you
+// hand it, even if the server doesn't advertise that mechanism —
+// which is exactly why smtp.PlainAuth fails against smtp.office365.com
+// (Microsoft advertises LOGIN + XOAUTH2 only; PLAIN is rejected with
+// "504 5.7.4 Unrecognized authentication type").
+//
+// Order of operations:
+//  1. TCP dial.
+//  2. EHLO (records server-advertised extensions).
+//  3. STARTTLS if advertised — Office 365 / Gmail / most modern
+//     submission endpoints require it on port 587.
+//  4. EHLO again (Client.StartTLS does this internally; the
+//     extension list refreshes — AUTH only appears post-TLS on
+//     stricter servers).
+//  5. Pick AUTH mechanism from the post-TLS list:
+//       - PLAIN if advertised (standard, base64 single round-trip)
+//       - else LOGIN if advertised (Microsoft, some older relays)
+//       - else error out
+//  6. MAIL/RCPT/DATA/QUIT.
+//
+// We intentionally do NOT speak SMTP over plaintext when credentials
+// are present — if the server doesn't advertise STARTTLS, the auth
+// step returns the "unencrypted connection" error from PlainAuth's
+// own guard. That's the safe default; relay-style deployments that
+// genuinely want plaintext auth can run their own postfix in front.
+func (s *EmailService) sendOnce(addr, to string, msg []byte) error {
+	// Validate addresses to match what net/smtp.SendMail does — no
+	// CR/LF that could be used for SMTP injection.
+	if err := validateSMTPLine(s.from); err != nil {
+		return err
+	}
+	if err := validateSMTPLine(to); err != nil {
+		return err
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	c, err := smtp.NewClient(conn, s.host)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("smtp client: %w", err)
+	}
+	defer c.Close() //nolint:errcheck
+
+	if err := c.Hello(localHostname()); err != nil {
+		return fmt.Errorf("ehlo: %w", err)
+	}
+
+	// STARTTLS upgrade if the server advertises it. (Client.StartTLS
+	// internally re-EHLOs so post-TLS extensions land in c.Extension.)
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		cfg := s.tlsConfig
+		if cfg == nil {
+			cfg = &tls.Config{ServerName: s.host, MinVersion: tls.VersionTLS12}
+		}
+		if err := c.StartTLS(cfg); err != nil {
+			return fmt.Errorf("starttls: %w", err)
+		}
+	}
+
+	if s.username != "" {
+		auth, perr := pickAuth(c, s.host, s.username, s.password)
+		if perr != nil {
+			return perr
+		}
+		if err := c.Auth(auth); err != nil {
+			return fmt.Errorf("auth: %w", err)
+		}
+	}
+
+	if err := c.Mail(s.from); err != nil {
+		return fmt.Errorf("mail from: %w", err)
+	}
+	if err := c.Rcpt(to); err != nil {
+		return fmt.Errorf("rcpt to: %w", err)
+	}
+	w, err := c.Data()
+	if err != nil {
+		return fmt.Errorf("data: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		_ = w.Close()
+		return fmt.Errorf("data write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("data close: %w", err)
+	}
+	return c.Quit()
+}
+
+// pickAuth selects an SMTP AUTH mechanism based on what the server
+// advertised in its post-TLS EHLO response. Preference order:
+//
+//  1. PLAIN — standard, single round-trip, supported by Gmail,
+//     SendGrid, Mailgun, Postmark, SES, Postfix.
+//  2. LOGIN — non-standard but widely supported; the ONLY mechanism
+//     Office 365 / Outlook / Exchange Online accepts for basic auth.
+//
+// Returns an error if the server requires AUTH but advertises neither
+// (typical for OAuth2-only endpoints — those need XOAUTH2 which is a
+// separate authentication flow).
+func pickAuth(c *smtp.Client, host, username, password string) (smtp.Auth, error) {
+	// Client.Extension returns (ok, params): ok = is the extension
+	// supported, params = the parameter string (for AUTH this is the
+	// space-separated list of mechanisms the server accepts).
+	ok, authExt := c.Extension("AUTH")
+	if !ok {
+		return nil, errors.New("smtp: server does not advertise AUTH (configure SMTP_USERNAME='' for anonymous relays)")
+	}
+	mechs := strings.ToUpper(authExt)
+	switch {
+	case strings.Contains(mechs, "PLAIN"):
+		return smtp.PlainAuth("", username, password, host), nil
+	case strings.Contains(mechs, "LOGIN"):
+		return &loginAuth{username: username, password: password, host: host}, nil
+	default:
+		return nil, fmt.Errorf("smtp: no supported AUTH mechanism (server advertised: %q)", authExt)
+	}
+}
+
+// loginAuth implements RFC-less SMTP AUTH LOGIN. Microsoft 365 /
+// Outlook.com / Exchange Online reject AUTH PLAIN with "504 5.7.4
+// Unrecognized authentication type" so we need this fallback.
+//
+// LOGIN is base64 challenge-response: server sends "Username:" then
+// "Password:" (both base64-encoded over the wire, but Client.Auth
+// decodes before passing to Next). Some servers omit the trailing
+// colon, send lowercase, or use a different word — match leniently.
+type loginAuth struct{ username, password, host string }
+
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	// Only allow LOGIN over TLS. The credentials go on the wire in
+	// (base64 of) plaintext — anything else is a credential leak.
+	if !server.TLS {
+		return "", nil, errors.New("smtp: refusing LOGIN auth on unencrypted connection")
+	}
+	if server.Name != a.host {
+		return "", nil, errors.New("smtp: wrong host name")
+	}
+	return "LOGIN", nil, nil
+}
+
+func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if !more {
+		return nil, nil
+	}
+	// Normalise the prompt: outer trim, drop trailing colon, inner
+	// trim (so " Username : " → "username"), lower-case. Tolerant
+	// of the variants seen across Microsoft / Postfix / Exim.
+	prompt := strings.ToLower(strings.TrimSpace(
+		strings.TrimRight(strings.TrimSpace(string(fromServer)), ":"),
+	))
+	switch prompt {
+	case "username", "user name":
+		return []byte(a.username), nil
+	case "password":
+		return []byte(a.password), nil
+	default:
+		return nil, fmt.Errorf("smtp: unexpected LOGIN challenge: %q", fromServer)
+	}
+}
+
+// validateSMTPLine rejects strings containing CR or LF so callers
+// can't smuggle additional SMTP commands through a header value.
+func validateSMTPLine(s string) error {
+	if strings.ContainsAny(s, "\r\n") {
+		return errors.New("smtp: line contains CR or LF")
+	}
+	return nil
+}
+
+// localHostname returns the EHLO argument. Some strict servers reject
+// "localhost" or empty values; "[127.0.0.1]" is universally accepted.
+func localHostname() string { return "[127.0.0.1]" }
 
 func (s *EmailService) SendLicenseCreated(to, productName, planName, licenseKey string) {
 	body := renderTemplate(s.getTemplate("license_created", tmplLicenseCreated), map[string]string{
