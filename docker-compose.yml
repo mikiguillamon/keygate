@@ -30,7 +30,7 @@ services:
       start_period: 10s
 
   postgres:
-    image: postgres:18-alpine
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: keygate
       POSTGRES_PASSWORD: keygate
